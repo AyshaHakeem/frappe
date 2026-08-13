@@ -7,7 +7,7 @@ the Node ``node_utils.get_conf`` reads) instead of re-porting the JSON parse.
 Config comes only from common_site_config.json / site_config.json — no env vars.
 
 ``frappe`` is imported lazily so this module can be imported in tests without a
-configured bench, and so import never precedes the gevent monkeypatch in server.py.
+configured bench.
 """
 
 from dataclasses import dataclass
@@ -29,6 +29,11 @@ class RealtimeConfig:
 	developer_mode: bool = False
 	webserver_port: int | None = None
 	webserver_host: str | None = None
+	# Only set this if an app registers blocking handlers. Every core handler is
+	# async, and permission checks are coroutines, so nothing built in uses threads.
+	# Each frappe_context handler also holds a DB connection for its whole cycle.
+	# Unset leaves the loop's default executor (min(32, cpu + 4)) in place.
+	worker_threads: int | None = None
 
 
 def get_config(sites_path: str | None = None) -> RealtimeConfig:
@@ -47,4 +52,5 @@ def get_config(sites_path: str | None = None) -> RealtimeConfig:
 		developer_mode=bool(conf.get("developer_mode")),
 		webserver_port=int(webserver_port) if webserver_port else None,
 		webserver_host=conf.get("webserver_host") or None,
+		worker_threads=int(conf["socketio_worker_threads"]) if conf.get("socketio_worker_threads") else None,
 	)
