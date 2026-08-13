@@ -19,6 +19,8 @@ DEFAULT_SOCKETIO_PORT = 9000
 # is silent on redis_queue, which should not happen in a real bench.
 DEFAULT_REDIS_QUEUE = "redis://127.0.0.1:11311"
 
+EMBEDDED_BACKEND = "python-embedded"
+
 
 @dataclass(frozen=True)
 class RealtimeConfig:
@@ -34,6 +36,9 @@ class RealtimeConfig:
 	# Each frappe_context handler also holds a DB connection for its whole cycle.
 	# Unset leaves the loop's default executor (min(32, cpu + 4)) in place.
 	worker_threads: int | None = None
+	# Sharing a process with the web app: call back in-process rather than looping
+	# HTTP back into ourselves.
+	embedded: bool = False
 
 
 def get_config(sites_path: str | None = None) -> RealtimeConfig:
@@ -53,4 +58,5 @@ def get_config(sites_path: str | None = None) -> RealtimeConfig:
 		webserver_port=int(webserver_port) if webserver_port else None,
 		webserver_host=conf.get("webserver_host") or None,
 		worker_threads=int(conf["socketio_worker_threads"]) if conf.get("socketio_worker_threads") else None,
+		embedded=conf.get("socketio_backend") == EMBEDDED_BACKEND,
 	)
