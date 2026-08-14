@@ -4,6 +4,7 @@
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from http.cookiejar import CookieJar
@@ -23,6 +24,13 @@ logger = logging.getLogger("frappe.realtime")
 
 HttpMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
 WebRequest = Callable[..., Awaitable[dict]]
+
+PERMISSION_TTL = 15
+PERMISSION_CACHE_MAX = 1024
+PERMISSION_PURGE_AT = PERMISSION_CACHE_MAX * 3 // 4
+
+# (site, user, doctype, name, ptype) -> (answer, expiry). One cache for the process.
+_permission_cache: dict[tuple[str, str, str, str, str], tuple[bool, float]] = {}
 
 
 @dataclass(frozen=True)
@@ -85,7 +93,14 @@ class Session:
 		return await self.request(path, method=method, params=params, body=body)
 
 	async def has_permission(self, doctype: str, name: str | None = None, ptype: str = "read") -> bool:
-		"""HTTP permission check against the web process (no DB in realtime)."""
+		"""HTTP permission check against the web process (no DB in realtime).
+
+		Each answer stays for PERMISSION_TTL seconds, for all the sockets of the user."""
+		key = (self.site, self.user, doctype, name or "", ptype)
+		now = time.monotonic()
+		if (cached := _permission_cache.get(key)) and now < cached[1]:
+			return cached[0]
+
 		try:
 			body = await self.get(
 				"/api/method/frappe.realtime.has_permission",
@@ -93,7 +108,20 @@ class Session:
 			)
 		except Exception:
 			return False
-		return bool(body.get("message"))
+
+		# One ttl for all the answers, thus the oldest answer is at the front. From
+		# PERMISSION_PURGE_AT the front goes if it is expired. At PERMISSION_CACHE_MAX it
+		# goes in all cases. pop() moves a new answer for an old key to the back.
+		while len(_permission_cache) >= PERMISSION_PURGE_AT:
+			oldest = next(iter(_permission_cache))
+			if _permission_cache[oldest][1] > now and len(_permission_cache) < PERMISSION_CACHE_MAX:
+				break
+			del _permission_cache[oldest]
+
+		allowed = bool(body.get("message"))
+		_permission_cache.pop(key, None)
+		_permission_cache[key] = (allowed, now + PERMISSION_TTL)
+		return allowed
 
 
 async def authenticate(environ: dict, namespace: str, config: RealtimeConfig) -> Session:
@@ -327,6 +355,7 @@ async def close_clients() -> None:
 
 	Both are bound to the loop that created them, so a restart must rebuild them."""
 	global _http_client, _secret_client
+	_permission_cache.clear()
 	if _http_client is not None:
 		await _http_client.aclose()
 		_http_client = None

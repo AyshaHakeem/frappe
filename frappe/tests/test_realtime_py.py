@@ -17,6 +17,7 @@ import asyncio
 import json
 import sys
 import threading
+import time
 import types
 import unittest
 from collections.abc import Awaitable, Callable, Iterator
@@ -207,6 +208,7 @@ class TestAuthHelpers(unittest.TestCase):
 
 class TestAuthenticate(unittest.IsolatedAsyncioTestCase):
 	def setUp(self):
+		auth_mod._permission_cache.clear()
 		patcher = patch.object(auth_mod, "get_socketio_secret", new=AsyncMock(return_value="secret"))
 		patcher.start()
 		self.addCleanup(patcher.stop)
@@ -530,6 +532,10 @@ class TestRegistry(unittest.TestCase):
 
 
 class TestSocket(unittest.IsolatedAsyncioTestCase):
+	def setUp(self):
+		# The permission cache belongs to the process, not to a socket.
+		auth_mod._permission_cache.clear()
+
 	def _socket(
 		self,
 		sio: FakeSio | None = None,
@@ -568,7 +574,70 @@ class TestSocket(unittest.IsolatedAsyncioTestCase):
 
 	async def test_has_permission_http(self):
 		self.assertTrue(await self._socket(request=make_request(1)).has_permission("DT", "n1"))
-		self.assertFalse(await self._socket(request=make_request(0)).has_permission("DT", "n1"))
+		self.assertFalse(await self._socket(request=make_request(0)).has_permission("DT", "n2"))
+
+	async def test_has_permission_is_kept_for_the_ttl(self):
+		calls = []
+		s = self._socket(request=make_request(1, record=calls))
+		self.assertTrue(await s.has_permission("DT", "n1"))
+		self.assertTrue(await s.has_permission("DT", "n1"))
+		self.assertTrue(await s.has_permission("DT", "n2"))
+		self.assertEqual(len(calls), 2)
+
+	async def test_the_sockets_of_a_user_share_the_answer(self):
+		calls = []
+		await self._socket(request=make_request(1, record=calls)).has_permission("DT", "n1")
+		await self._socket(request=make_request(1, record=calls)).has_permission("DT", "n1")
+		self.assertEqual(len(calls), 1)
+
+	async def test_two_users_do_not_share_the_answer(self):
+		calls = []
+		await self._socket(request=make_request(1, record=calls)).has_permission("DT", "n1")
+		s = self._socket(request=make_request(1, record=calls), user="c@d.com")
+		await s.has_permission("DT", "n1")
+		self.assertEqual(len(calls), 2)
+
+	async def test_a_kept_answer_expires(self):
+		calls = []
+		s = self._socket(request=make_request(1, record=calls))
+		with patch.object(auth_mod, "PERMISSION_TTL", -1):
+			await s.has_permission("DT", "n1")
+		await s.has_permission("DT", "n1")
+		self.assertEqual(len(calls), 2)
+
+	def _fill_cache(self, count: int, expiry: float) -> None:
+		auth_mod._permission_cache.update(
+			{("s1", "u", "DT", str(i), "read"): (True, expiry) for i in range(count)}
+		)
+
+	async def test_three_quarters_full_drops_the_expired_answers(self):
+		self._fill_cache(auth_mod.PERMISSION_PURGE_AT, 0)
+
+		await self._socket(request=make_request(1)).has_permission("DT", "n1")
+
+		self.assertNotIn(("s1", "u", "DT", "0", "read"), auth_mod._permission_cache)
+		self.assertEqual(len(auth_mod._permission_cache), auth_mod.PERMISSION_PURGE_AT)
+
+	async def test_a_full_cache_drops_the_oldest_fresh_answer(self):
+		self._fill_cache(auth_mod.PERMISSION_CACHE_MAX, time.monotonic() + 3600)
+
+		await self._socket(request=make_request(1)).has_permission("DT", "n1")
+
+		self.assertNotIn(("s1", "u", "DT", "0", "read"), auth_mod._permission_cache)
+		self.assertIn(("s1", "u", "DT", "1", "read"), auth_mod._permission_cache)
+		self.assertEqual(len(auth_mod._permission_cache), auth_mod.PERMISSION_CACHE_MAX)
+
+	async def test_a_failure_is_not_kept(self):
+		calls = []
+
+		async def failing_request(path, method="GET", params=None, body=None):
+			calls.append(path)
+			raise httpx.ConnectError("no web process")
+
+		s = self._socket(request=failing_request)
+		self.assertFalse(await s.has_permission("DT", "n1"))
+		self.assertFalse(await s.has_permission("DT", "n1"))
+		self.assertEqual(len(calls), 2)
 
 	async def test_has_permission_stays_on_the_loop(self):
 		# The check is async end to end, so it must not burn a worker thread — those
@@ -887,6 +956,9 @@ class TestBridge(unittest.IsolatedAsyncioTestCase):
 
 
 class TestCoreHandlers(unittest.IsolatedAsyncioTestCase):
+	def setUp(self):
+		auth_mod._permission_cache.clear()
+
 	def _socket(
 		self,
 		sio: FakeSio,
@@ -926,7 +998,7 @@ class TestCoreHandlers(unittest.IsolatedAsyncioTestCase):
 		self.assertIn("doctype:ToDo", sio.rooms_of("sid1"))
 
 		sio2 = FakeSio()
-		deny = self._socket(sio2, request=make_request(0))
+		deny = self._socket(sio2, request=make_request(0), user="c@d.com")
 		await handlers_mod.doctype_subscribe(deny, "ToDo")
 		self.assertNotIn("doctype:ToDo", sio2.rooms_of("sid1"))
 
