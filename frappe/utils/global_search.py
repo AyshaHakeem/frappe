@@ -408,6 +408,14 @@ def sync_values(values: list):
 	GlobalSearch = frappe.qb.Table("__global_search")
 	conflict_fields = ["content", "published", "title", "route"]
 
+	if frappe.db.db_type == "sqlite":
+		values = list(values)
+		for value in values:
+			frappe.db.delete("__global_search", {"doctype": value[0], "name": value[1]})
+		if values:
+			frappe.qb.into(GlobalSearch).columns(["doctype", "name", *conflict_fields]).insert(*values).run()
+		return
+
 	query = frappe.qb.into(GlobalSearch).columns(["doctype", "name", *conflict_fields]).insert(*values)
 
 	if frappe.db.db_type == "postgres":
@@ -440,6 +448,21 @@ def sync_value(value: dict):
 	:param value: dict of { doctype, name, content, published, title, route }
 	"""
 
+	if frappe.db.db_type == "sqlite":
+		sync_values(
+			[
+				(
+					value["doctype"],
+					value["name"],
+					value["content"],
+					value["published"],
+					value["title"],
+					value["route"],
+				)
+			]
+		)
+		return
+
 	frappe.db.multisql(
 		{
 			"mariadb": """INSERT INTO `__global_search`
@@ -459,10 +482,6 @@ def sync_value(value: dict):
 				`published`=%(published)s,
 				`title`=%(title)s,
 				`route`=%(route)s
-		""",
-			"sqlite": """INSERT OR REPLACE INTO `__global_search`
-			(`doctype`, `name`, `content`, `published`, `title`, `route`)
-			VALUES (%(doctype)s, %(name)s, %(content)s, %(published)s, %(title)s, %(route)s)
 		""",
 		},
 		value,
