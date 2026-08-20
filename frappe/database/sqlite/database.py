@@ -4,6 +4,12 @@ import warnings
 from datetime import date, datetime, time
 from pathlib import Path
 
+import sqlglot
+import sqlparse
+from sqlglot import expressions as exp
+from sqlglot.errors import ErrorLevel, SqlglotError
+from sqlparse import tokens as sqlparse_tokens
+
 import frappe
 from frappe.database.database import (
 	TRANSACTION_DISABLED_MSG,
@@ -11,10 +17,12 @@ from frappe.database.database import (
 	ImplicitCommitError,
 )
 from frappe.database.sqlite.schema import SQLiteTable
-from frappe.utils import get_table_name
+from frappe.utils import get_table_name, now
 
-_PARAM_COMP = re.compile(r"%\([\w]*\)s")
+# matches both bare `%s` and named `%(param)s` DB-API placeholders
+_PARAM_COMP = re.compile(r"%\(\w+\)s|%s")
 IMPLICIT_COMMIT_QUERY_TYPES = frozenset(("start", "alter", "drop", "create", "truncate"))
+_TRANSPILABLE_STATEMENTS = (exp.Select, exp.Insert, exp.Update, exp.Delete, exp.Union)
 
 
 class SequenceGeneratorLimitExceeded(sqlite3.Error):
@@ -117,6 +125,8 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 		conn = self.create_connection(read_only)
 		conn.create_function("regexp", 2, regexp)
 		conn.create_function("regexp_replace", 3, regexp_replace)
+		conn.create_function("regexp_like", 2, regexp_like)
+		conn.create_function("now", 0, now)
 		pragmas = {
 			"journal_mode": "WAL",
 			"synchronous": "NORMAL",
@@ -493,12 +503,13 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 		return mogrified_query
 
 	def sql(self, *args, **kwargs):
-		if args:
+		skip_transpilation = kwargs.pop("_skip_sqlite_transpilation", False)
+		if args and not skip_transpilation:
 			# since tuple is immutable
 			args = list(args)
 			args[0] = modify_query(args[0])
 			args = tuple(args)
-		elif kwargs.get("query"):
+		elif kwargs.get("query") and not skip_transpilation:
 			kwargs["query"] = modify_query(kwargs.get("query"))
 
 		return super().sql(*args, **kwargs)
@@ -605,15 +616,74 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 
 
 def modify_query(query):
-	"""
-	Modifies query according to the requirements of SQLite
-	"""
-	# Replace ` with " for definitions
+	"""Translate raw MariaDB-style SQL into SQLite SQL."""
 	query = str(query)
+	transpiled = _transpile_to_sqlite(query)
+	return transpiled if transpiled is not None else _legacy_modify_query(query)
+
+
+def _transpile_to_sqlite(query: str) -> str | None:
+	"""Returns the query rewritten for SQLite, or None if sqlglot couldn't
+	parse it (as MariaDB SQL), or didn't parse it as one of _TRANSPILABLE_STATEMENTS.
+
+	`%s` / `%(name)s` DB-API placeholders, aren't valid MySQL expressions on their own. They are replaced only when they are SQL placeholder tokens, so identical text inside strings and comments remains the same.
+	"""
+	try:
+		masked_query, parameters = _mask_query_parameters(query)
+		parsed_queries = sqlglot.parse(masked_query, read="mysql")
+		if len(parsed_queries) != 1 or parsed_queries[0] is None:
+			return None
+
+		parsed = parsed_queries[0]
+		if not isinstance(parsed, _TRANSPILABLE_STATEMENTS):
+			return None
+
+		# SQLite has no row-level locks. Remove only this known incompatibility;
+		# any other unsupported construct must take the safe fallback below.
+		for select in parsed.find_all(exp.Select):
+			select.set("locks", None)
+
+		rewritten = parsed.sql(dialect="sqlite", unsupported_level=ErrorLevel.RAISE)
+		return _restore_query_parameters(rewritten, parameters)
+	except (SqlglotError, ValueError):
+		return None
+
+
+def _mask_query_parameters(query: str) -> tuple[str, list[str]]:
+	parameters = []
+	parts = []
+	for statement in sqlparse.parse(query):
+		for token in statement.flatten():
+			if token.ttype in sqlparse_tokens.Name.Placeholder and _PARAM_COMP.fullmatch(token.value):
+				parameters.append(token.value)
+				parts.append("?")
+			else:
+				parts.append(token.value)
+	return "".join(parts), parameters
+
+
+def _restore_query_parameters(query: str, parameters: list[str]) -> str:
+	parameter_index = 0
+	parts = []
+	for statement in sqlparse.parse(query):
+		for token in statement.flatten():
+			if token.ttype in sqlparse_tokens.Name.Placeholder and token.value == "?":
+				if parameter_index >= len(parameters):
+					raise ValueError("SQLGlot introduced an unexpected placeholder")
+				token.value = parameters[parameter_index]
+				parameter_index += 1
+			parts.append(token.value)
+
+	if parameter_index != len(parameters):
+		raise ValueError("SQLGlot removed a query placeholder")
+	return "".join(parts)
+
+
+def _legacy_modify_query(query: str) -> str:
+	"""Fallback for queries sqlglot can't parse"""
 	query = query.replace("`", '"')
 	query = replace_locate_with_instr(query)
 
-	# Select from requires ""
 	if re.search("from tab", query, flags=re.IGNORECASE):
 		query = re.sub("from tab([a-zA-Z]*)", r'from "tab\1"', query, flags=re.IGNORECASE)
 
@@ -641,3 +711,7 @@ def regexp_replace(item: str, pattern: str, repl: str) -> str:
 	Define regexp_replace implementation for SQLite
 	"""
 	return re.sub(pattern, repl, item)
+
+
+def regexp_like(item: str, expr: str) -> bool:
+	return regexp(expr, item)

@@ -753,6 +753,148 @@ class TestDB(IntegrationTestCase):
 		self.assertEqual(frappe.db.sql("select 'abc' NOT REGEXP 'z'")[0][0], True)
 		self.assertEqual(frappe.db.sql("select 'A REGEXP B'")[0][0], "A REGEXP B")
 
+	@run_only_if(db_type_is.SQLITE)
+	def test_modify_query_transpiles_mariadb_sql_to_sqlite(self):
+		from frappe.database.sqlite.database import modify_query
+
+		# identifier quoting: backtick -> double quote, structurally, not by
+		# text substitution
+		self.assertEqual(
+			'SELECT "a", "b" FROM "tabItem"',
+			modify_query("select `a`, `b` from `tabItem`"),
+		)
+
+		# SQLite has no row-level locking; a raw query written against
+		# MariaDB/Postgres that ends in FOR UPDATE (and its OF/NOWAIT/SKIP
+		# LOCKED variants) would otherwise be a syntax error here.
+		self.assertEqual(
+			'SELECT * FROM "tabItem" LIMIT 1',
+			modify_query("select * from `tabItem` limit 1\n\t\tfor update"),
+		)
+		self.assertEqual(
+			'SELECT * FROM "tabItem" LIMIT 1',
+			modify_query("select * from `tabItem` limit 1 for update of `tabItem`"),
+		)
+		self.assertEqual(
+			'SELECT * FROM "tabItem" LIMIT 1',
+			modify_query("select * from `tabItem` limit 1 for update nowait"),
+		)
+		self.assertEqual(
+			'SELECT * FROM "tabItem" LIMIT 1',
+			modify_query("select * from `tabItem` limit 1 for update skip locked"),
+		)
+
+		# LOCATE(needle, haystack) -> INSTR(haystack, needle): SQLite has no
+		# LOCATE, and the argument order is swapped between the two
+		self.assertEqual(
+			"SELECT INSTR(name, 'a') FROM \"tabItem\"",
+			modify_query("select locate('a', name) from `tabItem`"),
+		)
+
+		# other common MariaDB functions with no direct SQLite equivalent
+		self.assertEqual(
+			"SELECT STRFTIME('%Y-%m-%d', creation) FROM \"tabItem\"",
+			modify_query("select date_format(creation, '%Y-%m-%d') from `tabItem`"),
+		)
+		self.assertEqual(
+			"SELECT IIF(a > 0, 'x', 'y') FROM \"tabItem\"",
+			modify_query("select if(a > 0, 'x', 'y') from `tabItem`"),
+		)
+		# Raw SQL does not have to use backticks to need translation.
+		self.assertEqual(
+			"SELECT IIF(name = %s, %(yes)s, %(no)s) FROM tabUser",
+			modify_query("select if(name = %s, %(yes)s, %(no)s) from tabUser for update"),
+		)
+
+		# both %(name)s and bare %s placeholders must round-trip unchanged,
+		# since sqlglot can't parse either as valid SQL on its own
+		self.assertEqual(
+			'SELECT * FROM "tabItem" WHERE item_code = %(item_code)s AND name = %s',
+			modify_query("select * from `tabItem` where item_code = %(item_code)s and name = %s for update"),
+		)
+
+		# a column/table name that merely starts with "for" must not
+		# false-positive as part of a locking clause
+		self.assertEqual(
+			'SELECT * FROM "tabForum Post"',
+			modify_query("select * from `tabForum Post`"),
+		)
+		# nor must "for update" appearing inside a string literal
+		self.assertEqual(
+			"SELECT 'please for update your records' FROM \"tabItem\"",
+			modify_query("select 'please for update your records' from `tabItem`"),
+		)
+
+		# Placeholder-looking text in literals and comments is data, not a
+		# parameter. Only the final %s should be masked and restored.
+		translated = modify_query(
+			"select 'literal %s', `name` from `tabUser` where `name`=%s -- %(ignored)s\n"
+		)
+		self.assertIn("'literal %s'", translated)
+		self.assertIn('"name" = %s', translated)
+		self.assertIn("%(ignored)s", translated)
+
+	@run_only_if(db_type_is.SQLITE)
+	def test_query_builder_sql_skips_mariadb_transpilation(self):
+		user = frappe.qb.DocType("User")
+		query = frappe.qb.from_(user).select(user.name).where(user.name == "Administrator")
+
+		# frappe.qb already emits SQLite SQL. Re-parsing its double-quoted
+		# identifiers as MariaDB would turn them into string literals.
+		with patch(
+			"frappe.database.sqlite.database.modify_query",
+			side_effect=AssertionError("query-builder SQL was transpiled again"),
+		):
+			self.assertEqual(query.run(), [("Administrator",)])
+
+	@run_only_if(db_type_is.SQLITE)
+	def test_modify_query_falls_back_for_unparseable_queries(self):
+		import sqlglot
+		from sqlglot.errors import SqlglotError
+
+		from frappe.database.sqlite.database import modify_query
+
+		# a query with no backtick at all is assumed to already be valid
+		# SQLite SQL (e.g. frappe.qb output) and is never routed through
+		# sqlglot - this one needs a backtick to actually exercise the
+		# "sqlglot can't parse this" fallback path, not just the "no
+		# backtick, skip transpilation entirely" one
+		garbage = "select * from `tabItem` where ((( not valid for update"
+		# confirm it genuinely fails to parse, so this is testing what it says it is
+		self.assertRaises(SqlglotError, sqlglot.parse_one, garbage, read="mysql")
+
+		# modify_query() must not raise - it should degrade to the legacy
+		# text-rewrite fallback (backtick -> double-quote, in this case)
+		# rather than propagate the parse error
+		self.assertEqual(
+			'select * from "tabItem" where ((( not valid for update',
+			modify_query(garbage),
+		)
+
+	@run_only_if(db_type_is.SQLITE)
+	def test_regexp_operator_executes_via_regexp_like_udf(self):
+		# MariaDB's `X REGEXP Y` transpiles to `REGEXP_LIKE(X, Y)`, a
+		# function SQLite has no built-in for - regression-guards the
+		# regexp_like() UDF registered specifically to back it (argument
+		# order reversed from the pre-existing `regexp` UDF, which matches
+		# SQLite's own native `X REGEXP Y` -> `regexp(Y, X)` convention).
+		self.assertEqual(
+			1, frappe.db.sql("select `name` REGEXP 'Adm' from `tabUser` where `name` = 'Administrator'")[0][0]
+		)
+		self.assertEqual(
+			0,
+			frappe.db.sql(
+				"select `name` REGEXP 'zzz-no-match' from `tabUser` where `name` = 'Administrator'"
+			)[0][0],
+		)
+
+	@run_only_if(db_type_is.SQLITE)
+	def test_transpiled_mariadb_functions_execute(self):
+		self.assertEqual(frappe.db.sql("select if(%s, 'yes', 'no')", (1,))[0][0], "yes")
+		# SQLGlot keeps MariaDB's NOW() spelling, so SQLite provides a small
+		# compatibility function for it.
+		self.assertIsInstance(frappe.db.sql("select now()")[0][0], str)
+
 	def test_regex_filter_operator(self):
 		# pypika's Term.regex renders " REGEX ", which is not an operator on either backend
 		matched = frappe.get_all("User", filters={"name": ["regex", "^Administrator$"]}, pluck="name")

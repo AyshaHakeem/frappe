@@ -165,6 +165,9 @@ def execute_query(query, *args, **kwargs):
 	fields = query.__dict__.get("_fields_list", [])
 	child_queries = query._child_queries
 	query, params = prepare_query(query)
+	if frappe.local.db.db_type == "sqlite":
+		# The SQLite query builder already emitted the target dialect.
+		kwargs["_skip_sqlite_transpilation"] = True
 	result = frappe.local.db.sql(query, params, *args, **kwargs)  # nosemgrep
 
 	if child_queries and isinstance(child_queries, list) and result:
