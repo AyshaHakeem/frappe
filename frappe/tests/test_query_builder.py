@@ -741,15 +741,15 @@ class TestBuilderSQLite(IntegrationTestCase, TestBuilderBase):
 
 	def setUp(self):
 		super().setUp()
-		frappe.db.sql_ddl(f'DROP TABLE IF EXISTS "{self.table_name}"')
+		frappe.db.sql_ddl(f"DROP TABLE IF EXISTS `{self.table_name}`")
 		frappe.db.sql_ddl(
-			f"""CREATE TABLE "{self.table_name}" (
-				"identity" TEXT PRIMARY KEY,
-				"mutable" TEXT NOT NULL,
-				"immutable" TEXT NOT NULL
+			f"""CREATE TABLE `{self.table_name}` (
+				`identity` TEXT PRIMARY KEY,
+				`mutable` TEXT NOT NULL,
+				`immutable` TEXT NOT NULL
 			)"""
 		)
-		self.addCleanup(frappe.db.sql_ddl, f'DROP TABLE IF EXISTS "{self.table_name}"')
+		self.addCleanup(frappe.db.sql_ddl, f"DROP TABLE IF EXISTS `{self.table_name}`")
 
 	def test_on_conflict_updates_selected_columns(self):
 		table = frappe.qb.Table(self.table_name)
@@ -767,7 +767,7 @@ class TestBuilderSQLite(IntegrationTestCase, TestBuilderBase):
 
 		self.assertEqual(
 			frappe.db.sql(
-				f'SELECT "mutable", "immutable" FROM "{self.table_name}" WHERE "identity" = %s',
+				f"SELECT `mutable`, `immutable` FROM `{self.table_name}` WHERE `identity` = %s",
 				("row",),
 			)[0],
 			("new", "preserved"),
@@ -789,7 +789,7 @@ class TestBuilderSQLite(IntegrationTestCase, TestBuilderBase):
 
 		self.assertEqual(
 			frappe.db.sql(
-				f'SELECT "mutable", "immutable" FROM "{self.table_name}" WHERE "identity" = %s',
+				f"SELECT `mutable`, `immutable` FROM `{self.table_name}` WHERE `identity` = %s",
 				("row",),
 			)[0],
 			("old", "preserved"),
@@ -815,7 +815,7 @@ class TestBuilderSQLite(IntegrationTestCase, TestBuilderBase):
 		query.run()
 		self.assertEqual(
 			frappe.db.sql(
-				f'SELECT "mutable", "immutable" FROM "{self.table_name}" WHERE "identity" = %s',
+				f"SELECT `mutable`, `immutable` FROM `{self.table_name}` WHERE `identity` = %s",
 				("row",),
 			)[0],
 			("forced", "preserved"),
@@ -838,7 +838,7 @@ class TestBuilderSQLite(IntegrationTestCase, TestBuilderBase):
 
 		self.assertEqual(
 			frappe.db.sql(
-				f'SELECT "mutable", "immutable" FROM "{self.table_name}" WHERE "identity" = %s',
+				f"SELECT `mutable`, `immutable` FROM `{self.table_name}` WHERE `identity` = %s",
 				("row",),
 			)[0],
 			("new", "preserved"),

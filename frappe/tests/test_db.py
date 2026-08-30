@@ -2,6 +2,7 @@
 # License: MIT. See LICENSE
 
 import datetime
+import sqlite3
 from math import ceil
 from random import choice
 from unittest.mock import patch
@@ -894,6 +895,103 @@ class TestDB(IntegrationTestCase):
 		# SQLGlot keeps MariaDB's NOW() spelling, so SQLite provides a small
 		# compatibility function for it.
 		self.assertIsInstance(frappe.db.sql("select now()")[0][0], str)
+
+	@run_only_if(db_type_is.SQLITE)
+	def test_change_column_type_preserves_sqlite_schema(self):
+		doctype = "SQLiteSchemaPreservationProbe"
+		table = f"tab{doctype}"
+		frappe.db.sql_ddl(f"DROP TABLE IF EXISTS `{table}`")
+		frappe.db.sql_ddl(
+			f"""CREATE TABLE `{table}` (
+				`name` TEXT PRIMARY KEY,
+				`category` TEXT NOT NULL DEFAULT 'general',
+				`active` INTEGER NOT NULL DEFAULT 1,
+				`value` TEXT,
+				UNIQUE (`category`, `value`)
+			)"""
+		)
+		frappe.db.sql_ddl(f"CREATE INDEX `{table}_category_idx` ON `{table}` (`category`)")
+		frappe.db.sql_ddl(
+			f"CREATE INDEX `{table}_active_value_idx` ON `{table}` (`value`) WHERE `active` = 1"
+		)
+		self.addCleanup(frappe.db.sql_ddl, f"DROP TABLE IF EXISTS `{table}`")
+		frappe.db.sql(f"INSERT INTO `{table}` (`name`, `value`) VALUES (%s, %s)", ("row1", "old"))
+
+		explicit_indexes = dict(
+			frappe.db.sql(
+				"SELECT name, sql FROM sqlite_master "
+				"WHERE type = 'index' AND tbl_name = %s AND sql IS NOT NULL",
+				(table,),
+			)
+		)
+		frappe.db.change_column_type(doctype, "value", "VARCHAR(100)", nullable=True)
+
+		columns = {
+			column["name"]: column for column in frappe.db.sql(f"PRAGMA table_info(`{table}`)", as_dict=True)
+		}
+		self.assertEqual(columns["name"]["pk"], 1)
+		self.assertEqual(columns["category"]["notnull"], 1)
+		self.assertEqual(columns["category"]["dflt_value"], "'general'")
+		self.assertEqual(columns["active"]["dflt_value"], "1")
+		self.assertEqual(
+			dict(
+				frappe.db.sql(
+					"SELECT name, sql FROM sqlite_master "
+					"WHERE type = 'index' AND tbl_name = %s AND sql IS NOT NULL",
+					(table,),
+				)
+			),
+			explicit_indexes,
+		)
+		with self.assertRaises(sqlite3.IntegrityError):
+			frappe.db.sql(f"INSERT INTO `{table}` (`name`, `value`) VALUES (%s, %s)", ("row1", "new"))
+		with self.assertRaises(sqlite3.IntegrityError):
+			frappe.db.sql(
+				f"INSERT INTO `{table}` (`name`, `category`, `value`) VALUES (%s, %s, %s)",
+				("row2", "general", "old"),
+			)
+
+	@run_only_if(db_type_is.SQLITE)
+	def test_failed_sqlite_rebuild_keeps_original_table(self):
+		from frappe.database.sqlite.database import rebuild_table
+
+		table = "tabSQLiteAtomicRebuildProbe"
+		frappe.db.sql_ddl(f"DROP TABLE IF EXISTS `{table}`")
+		frappe.db.sql_ddl(f"CREATE TABLE `{table}` (`name` TEXT PRIMARY KEY, `value` TEXT)")
+		self.addCleanup(frappe.db.sql_ddl, f"DROP TABLE IF EXISTS `{table}`")
+		frappe.db.sql(
+			f"INSERT INTO `{table}` (`name`, `value`) VALUES (%s, %s), (%s, %s)",
+			("row1", "duplicate", "row2", "duplicate"),
+		)
+
+		with self.assertRaises(sqlite3.IntegrityError):
+			rebuild_table(
+				table,
+				["`name` TEXT", "`value` TEXT", "UNIQUE (`value`)"],
+				["name", "value"],
+			)
+
+		self.assertEqual(
+			frappe.db.sql(f"SELECT `name`, `value` FROM `{table}` ORDER BY `name`"),
+			[("row1", "duplicate"), ("row2", "duplicate")],
+		)
+		self.assertFalse(frappe.db.has_table("SQLiteAtomicRebuildProbe_new"))
+
+	@run_only_if(db_type_is.SQLITE)
+	def test_sqlite_rebuild_preserves_autoincrement_sequence(self):
+		table = "tabSQLiteAutoincrementRebuildProbe"
+		frappe.db.sql_ddl(f"DROP TABLE IF EXISTS `{table}`")
+		frappe.db.sql_ddl(f"CREATE TABLE `{table}` (`name` INTEGER PRIMARY KEY AUTOINCREMENT, `value` TEXT)")
+		self.addCleanup(frappe.db.sql_ddl, f"DROP TABLE IF EXISTS `{table}`")
+		frappe.db.sql(f"INSERT INTO `{table}` (`value`) VALUES (%s), (%s)", ("one", "two"))
+		frappe.db.sql(f"DELETE FROM `{table}` WHERE `name` = 2")
+
+		frappe.db.change_column_type(
+			"SQLiteAutoincrementRebuildProbe", "value", "VARCHAR(100)", nullable=True
+		)
+		frappe.db.sql(f"INSERT INTO `{table}` (`value`) VALUES (%s)", ("three",))
+
+		self.assertEqual(frappe.db.sql(f"SELECT MAX(`name`) FROM `{table}`")[0][0], 3)
 
 	def test_regex_filter_operator(self):
 		# pypika's Term.regex renders " REGEX ", which is not an operator on either backend
