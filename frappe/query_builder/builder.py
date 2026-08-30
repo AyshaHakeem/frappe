@@ -218,7 +218,11 @@ class SQLiteConflictQueryBuilderMixin:
 
 
 class RecursiveSQLLiteQueryBuilder(RecursiveCTEMixin, SQLiteConflictQueryBuilderMixin, SQLLiteQueryBuilder):
-	pass
+	def __init__(self, *args, **kwargs):
+		# SQLite accepts compound SELECT statements, but not the parentheses that PyPika adds around every branch by default:
+		#   (SELECT ...) UNION (SELECT ...) ;invalid on SQLite
+		kwargs.setdefault("wrap_set_operation_queries", False)
+		super().__init__(*args, **kwargs)
 
 
 class MariaDB(Base, MySQLQuery):
