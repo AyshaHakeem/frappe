@@ -585,7 +585,9 @@ def web_search(text: str, scope: str | None = None, start: int = 0, limit: int =
 
 		scope_condition = "`route` like %(scope)s AND " if scope else ""
 		published_condition = "`published` = 1 AND "
-		mariadb_conditions = postgres_conditions = " ".join([published_condition, scope_condition])
+		mariadb_conditions = postgres_conditions = sqlite_conditions = " ".join(
+			[published_condition, scope_condition]
+		)
 
 		# https://mariadb.com/kb/en/library/full-text-index-overview/#in-boolean-mode
 		mariadb_conditions += "MATCH(`content`) AGAINST ({} IN BOOLEAN MODE)".format(
@@ -594,6 +596,10 @@ def web_search(text: str, scope: str | None = None, start: int = 0, limit: int =
 		postgres_conditions += (
 			f"to_tsvector('english', \"content\") @@ plainto_tsquery('english', {frappe.db.escape(text)})"
 		)
+		# __global_search is an FTS5 virtual table on sqlite: MATCH is only valid as a WHERE
+		# condition. A literal phrase, quotes doubled per FTS5's escaping convention, with a trailing prefix match on the last token mirrors MariaDB's `+text*`.
+		sqlite_phrase = '"' + text.replace('"', '""') + '"*'
+		sqlite_conditions += f"`content` MATCH {frappe.db.escape(sqlite_phrase)}"
 
 		values = {"scope": "".join([scope, "%"]) if scope else "", "limit": limit, "start": start}
 
@@ -601,6 +607,7 @@ def web_search(text: str, scope: str | None = None, start: int = 0, limit: int =
 			{
 				"mariadb": common_query.format(conditions=mariadb_conditions),
 				"postgres": common_query.format(conditions=postgres_conditions),
+				"sqlite": common_query.format(conditions=sqlite_conditions),
 			},
 			values=values,
 			as_dict=True,
