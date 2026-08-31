@@ -1,14 +1,14 @@
+import json
 import re
 import sqlite3
 import warnings
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import sqlglot
-import sqlparse
 from sqlglot import expressions as exp
 from sqlglot.errors import ErrorLevel, SqlglotError
-from sqlparse import tokens as sqlparse_tokens
 
 import frappe
 from frappe.database.database import (
@@ -18,9 +18,393 @@ from frappe.database.database import (
 from frappe.database.sqlite.schema import SQLiteTable
 from frappe.utils import get_datetime, get_table_name, now
 
-# matches both bare `%s` and named `%(param)s` DB-API placeholders
-_PARAM_COMP = re.compile(r"%\(\w+\)s|%s")
+_NAMED_PARAM_COMP = re.compile(r"%\((?P<name>\w+)\)s")
+_TIME_COMP = re.compile(
+	r"(?P<sign>[+-]?)(?P<hours>\d+):(?P<minutes>[0-5]\d):(?P<seconds>[0-5]\d)(?:\.(?P<fraction>\d+))?"
+)
 _TRANSPILABLE_STATEMENTS = (exp.Select, exp.Insert, exp.Update, exp.Delete, exp.Union)
+
+
+def _convert_date(value: bytes) -> date:
+	# Decode a SQLite DATE value, ignoring any trailing time component.MariaDB truncates DATETIME values stored in DATE columns, while SQLite does not. Strip the time here to keep SQLite behavior consistent with MariaDB.
+	return date.fromisoformat(value.decode().split(" ", 1)[0])
+
+
+def _convert_time(value: bytes) -> timedelta:
+	"""Decode a SQLite TIME value using Frappe's timedelta convention.
+
+	Unlike ``datetime.time``, a timedelta can represent MariaDB-compatible TIME
+	values beyond 24 hours and negative durations.
+	"""
+	return _parse_time_duration(value)
+
+
+def _parse_time_duration(value) -> timedelta:
+	if isinstance(value, timedelta):
+		return value
+	if isinstance(value, time):
+		return timedelta(
+			hours=value.hour,
+			minutes=value.minute,
+			seconds=value.second,
+			microseconds=value.microsecond,
+		)
+	if isinstance(value, bytes):
+		value = value.decode()
+	text = str(value)
+	match = _TIME_COMP.fullmatch(text)
+	if not match:
+		raise ValueError(f"Invalid TIME value: {text!r}")
+
+	fraction = (match["fraction"] or "")[:6].ljust(6, "0")
+	result = timedelta(
+		hours=int(match["hours"]),
+		minutes=int(match["minutes"]),
+		seconds=int(match["seconds"]),
+		microseconds=int(fraction or 0),
+	)
+	return -result if match["sign"] == "-" else result
+
+
+def frappe_combine_datetime(date_value, time_value):
+	"""Add a MariaDB-style TIME duration to a date or datetime value."""
+	if date_value is None or time_value is None:
+		return None
+	if isinstance(date_value, bytes):
+		date_value = date_value.decode()
+	try:
+		base = (
+			datetime.combine(date_value, time())
+			if isinstance(date_value, date) and not isinstance(date_value, datetime)
+			else datetime.fromisoformat(str(date_value))
+		)
+		result = base + _parse_time_duration(time_value)
+	except (TypeError, ValueError):
+		return None
+	return result.isoformat(sep=" ", timespec="microseconds" if result.microsecond else "seconds")
+
+
+def _sunday_first_week(value: datetime) -> tuple[int, int]:
+	"""Return MySQL mode-2 week-year/week: Sunday first, range 1..53."""
+	week = int(value.strftime("%U"))
+	if week:
+		return value.year, week
+	previous_year = datetime(value.year - 1, 12, 31)
+	return previous_year.year, int(previous_year.strftime("%U"))
+
+
+def _mysql_date_format_token(value: datetime, token: str) -> str:
+	if token == "%a":
+		return value.strftime("%a")
+	if token == "%b":
+		return value.strftime("%b")
+	if token == "%c":
+		return str(value.month)
+	if token == "%D":
+		suffix = "th" if 10 < value.day % 100 < 14 else {1: "st", 2: "nd", 3: "rd"}.get(value.day % 10, "th")
+		return f"{value.day}{suffix}"
+	if token == "%d":
+		return f"{value.day:02}"
+	if token == "%e":
+		return str(value.day)
+	if token == "%f":
+		return f"{value.microsecond:06}"
+	if token == "%H":
+		return f"{value.hour:02}"
+	if token in {"%h", "%I"}:
+		return f"{value.hour % 12 or 12:02}"
+	if token == "%i":
+		return f"{value.minute:02}"
+	if token == "%j":
+		return f"{value.timetuple().tm_yday:03}"
+	if token == "%k":
+		return str(value.hour)
+	if token == "%l":
+		return str(value.hour % 12 or 12)
+	if token == "%M":
+		return value.strftime("%B")
+	if token == "%m":
+		return f"{value.month:02}"
+	if token == "%p":
+		return "AM" if value.hour < 12 else "PM"
+	if token == "%r":
+		return f"{value.hour % 12 or 12:02}:{value.minute:02}:{value.second:02} {'AM' if value.hour < 12 else 'PM'}"
+	if token in {"%S", "%s"}:
+		return f"{value.second:02}"
+	if token == "%T":
+		return f"{value.hour:02}:{value.minute:02}:{value.second:02}"
+	if token == "%U":
+		return value.strftime("%U")
+	if token == "%u":
+		return value.strftime("%W")
+	if token == "%V":
+		return f"{_sunday_first_week(value)[1]:02}"
+	if token == "%v":
+		return f"{value.isocalendar().week:02}"
+	if token == "%W":
+		return value.strftime("%A")
+	if token == "%w":
+		return str((value.weekday() + 1) % 7)
+	if token == "%X":
+		return str(_sunday_first_week(value)[0])
+	if token == "%x":
+		return str(value.isocalendar().year)
+	if token == "%Y":
+		return f"{value.year:04}"
+	if token == "%y":
+		return f"{value.year % 100:02}"
+	if token == "%%":
+		return "%"
+	# MariaDB emits the character itself for an otherwise unknown % token.
+	return token[1:]
+
+
+def frappe_date_format(value, format_string):
+	"""SQLite UDF for MySQL DATE_FORMAT tokens not supported by strftime."""
+	if value is None or format_string is None:
+		return None
+	if isinstance(value, bytes):
+		value = value.decode()
+	if isinstance(format_string, bytes):
+		format_string = format_string.decode()
+	if isinstance(value, date) and not isinstance(value, datetime):
+		value = datetime.combine(value, time())
+	elif not isinstance(value, datetime):
+		try:
+			value = datetime.fromisoformat(str(value))
+		except ValueError:
+			return None
+
+	result = []
+	index = 0
+	while index < len(format_string):
+		if format_string[index] != "%" or index + 1 >= len(format_string):
+			result.append(format_string[index])
+			index += 1
+			continue
+		result.append(_mysql_date_format_token(value, format_string[index : index + 2]))
+		index += 2
+	return "".join(result)
+
+
+def _json_contains(target, candidate) -> bool:
+	if isinstance(target, dict):
+		return isinstance(candidate, dict) and all(
+			key in target and _json_contains(target[key], value) for key, value in candidate.items()
+		)
+	if isinstance(target, list):
+		candidates = candidate if isinstance(candidate, list) else [candidate]
+		return all(any(_json_contains(value, wanted) for value in target) for wanted in candidates)
+	if isinstance(candidate, dict | list):
+		return False
+	if isinstance(target, bool) or isinstance(candidate, bool):
+		return type(target) is type(candidate) and target == candidate
+	if isinstance(target, int | float) and isinstance(candidate, int | float):
+		return target == candidate
+	return type(target) is type(candidate) and target == candidate
+
+
+def frappe_json_contains(target, candidate):
+	"""Return MariaDB-style recursive JSON containment as a deterministic SQLite UDF."""
+	if target is None or candidate is None:
+		return None
+	if isinstance(target, bytes):
+		target = target.decode()
+	if isinstance(candidate, bytes):
+		candidate = candidate.decode()
+	target = json.loads(target) if isinstance(target, str) else target
+	candidate = json.loads(candidate) if isinstance(candidate, str) else candidate
+	return int(_json_contains(target, candidate))
+
+
+def _skip_quoted_sql(query: str, index: int) -> int:
+	opening = query[index]
+	closing = "]" if opening == "[" else opening
+	index += 1
+	while index < len(query):
+		# The source dialect is MariaDB before SQLGlot translation, where a
+		# backslash can escape the next quote inside string literals.
+		if opening in "'\"" and query[index] == "\\":
+			index += 2
+			continue
+		if query[index] == closing:
+			if index + 1 < len(query) and query[index + 1] == closing:
+				index += 2
+				continue
+			return index + 1
+		index += 1
+	return index
+
+
+def _skip_sql_trivia(query: str, index: int) -> int:
+	while index < len(query):
+		if query[index].isspace():
+			index += 1
+		elif query.startswith("/*", index):
+			end = query.find("*/", index + 2)
+			index = len(query) if end < 0 else end + 2
+		elif query.startswith("--", index) or query[index] == "#":
+			end = query.find("\n", index + 1)
+			index = len(query) if end < 0 else end + 1
+		else:
+			break
+	return index
+
+
+def _iter_query_placeholders(query: str, *, qmark: bool = False):
+	"""Yield real placeholders while skipping SQL strings, identifiers and comments."""
+	index = 0
+	previous_code_character = None
+	while index < len(query):
+		character = query[index]
+		if character.isspace():
+			index += 1
+			continue
+		if query.startswith("/*", index):
+			index = _skip_sql_trivia(query, index)
+			continue
+		if query.startswith("--", index) or character == "#":
+			index = _skip_sql_trivia(query, index)
+			continue
+		if character in "'\"`[":
+			index = _skip_quoted_sql(query, index)
+			previous_code_character = character
+			continue
+
+		end = None
+		name = None
+		if qmark and character == "?":
+			end = index + 1
+			while end < len(query) and query[end].isdigit():
+				end += 1
+			if end > index + 1:
+				name = int(query[index + 1 : end])
+		elif not qmark and query.startswith("%s", index):
+			previous_character = query[index - 1] if index else ""
+			next_character = query[index + 2] if index + 2 < len(query) else ""
+			if not (
+				(previous_character and (previous_character.isalnum() or previous_character in "_$"))
+				or (next_character and (next_character.isalnum() or next_character in "_$"))
+			):
+				end = index + 2
+		elif not qmark and character == "%" and (match := _NAMED_PARAM_COMP.match(query, index)):
+			end = match.end()
+			name = match["name"]
+
+		if end is not None:
+			next_code_index = _skip_sql_trivia(query, end)
+			parenthesized = (
+				previous_code_character == "("
+				and next_code_index < len(query)
+				and query[next_code_index] == ")"
+			)
+			yield index, end, name, parenthesized
+			previous_code_character = "?"
+			index = end
+			continue
+
+		previous_code_character = character
+		index += 1
+
+
+def _expand_bound_parameter(value, *, parenthesized: bool) -> tuple[str, list]:
+	if not isinstance(value, list | tuple):
+		return "?", [value]
+	placeholders = ",".join("?" for _ in value)
+	return (placeholders if parenthesized else f"({placeholders})"), list(value)
+
+
+def _prepare_query_parameters(query: str, values) -> tuple[str, object]:
+	"""Convert Frappe's pyformat placeholders to SQLite bindings without interpolating data."""
+	if values is None:
+		return query, ()
+	if "%" not in query:
+		return query, values
+
+	placeholders = list(_iter_query_placeholders(query))
+	if not placeholders:
+		return query, values
+	parts = []
+	bound_values = []
+	query_position = 0
+
+	if isinstance(values, dict):
+		for start, end, name, parenthesized in placeholders:
+			parts.append(query[query_position:start])
+			if name is None:
+				raise sqlite3.ProgrammingError("Positional %s placeholder used with mapping parameters")
+			if name not in values:
+				raise sqlite3.ProgrammingError(f"Missing query parameter: {name}")
+			replacement, expanded = _expand_bound_parameter(values[name], parenthesized=parenthesized)
+			parts.append(replacement)
+			bound_values.extend(expanded)
+			query_position = end
+		parts.append(query[query_position:])
+		return "".join(parts), tuple(bound_values)
+
+	positional_values = tuple(values) if isinstance(values, list | tuple) else (values,)
+	position = 0
+	for start, end, name, parenthesized in placeholders:
+		parts.append(query[query_position:start])
+		if name is not None:
+			raise sqlite3.ProgrammingError("Named placeholder used with positional parameters")
+		if position >= len(positional_values):
+			raise sqlite3.ProgrammingError("Not enough query parameters")
+		replacement, expanded = _expand_bound_parameter(
+			positional_values[position], parenthesized=parenthesized
+		)
+		parts.append(replacement)
+		bound_values.extend(expanded)
+		position += 1
+		query_position = end
+
+	if position != len(positional_values):
+		raise sqlite3.ProgrammingError("Too many query parameters")
+	parts.append(query[query_position:])
+	return "".join(parts), tuple(bound_values)
+
+
+def _sqlite_parameter_literal(value) -> str:
+	"""Render a bound value only for readable query logs, never for execution."""
+	if value is None:
+		return "NULL"
+	if isinstance(value, bool):
+		return "1" if value else "0"
+	if isinstance(value, bytes):
+		return f"X'{value.hex()}'"
+	if isinstance(value, datetime | date | time):
+		value = value.isoformat(sep=" ") if isinstance(value, datetime) else value.isoformat()
+	elif isinstance(value, timedelta):
+		value = str(value)
+	if isinstance(value, str):
+		return "'" + value.replace("'", "''") + "'"
+	return str(value)
+
+
+def _mogrify_sqlite_query(query: str, values) -> str:
+	if not values or isinstance(values, dict):
+		return query
+	placeholders = list(_iter_query_placeholders(query, qmark=True))
+	parameter_slots = []
+	highest_slot = 0
+	for _start, _end, explicit_slot, _parenthesized in placeholders:
+		if explicit_slot is None:
+			highest_slot += 1
+			parameter_slots.append(highest_slot)
+		elif explicit_slot > 0:
+			highest_slot = max(highest_slot, explicit_slot)
+			parameter_slots.append(explicit_slot)
+		else:
+			raise sqlite3.ProgrammingError("SQLite parameter numbers start at 1")
+	if highest_slot != len(values):
+		raise sqlite3.ProgrammingError("Query placeholder count does not match bound values")
+	parts = []
+	query_position = 0
+	for (start, end, _name, _parenthesized), slot in zip(placeholders, parameter_slots, strict=True):
+		parts.extend((query[query_position:start], _sqlite_parameter_literal(values[slot - 1])))
+		query_position = end
+	parts.append(query[query_position:])
+	return "".join(parts)
 
 
 class SequenceGeneratorLimitExceeded(sqlite3.Error):
@@ -120,10 +504,16 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 	SequenceGeneratorLimitExceeded = SequenceGeneratorLimitExceeded
 
 	def get_connection(self, read_only: bool = False):
+		if not hasattr(self, "_session_time_zone"):
+			self._session_time_zone = ZoneInfo("UTC")
 		conn = self.create_connection(read_only)
 		conn.create_function("regexp", 2, regexp)
 		conn.create_function("regexp_replace", 3, regexp_replace)
 		conn.create_function("regexp_like", 2, regexp_like)
+		conn.create_function("frappe_combine_datetime", 2, frappe_combine_datetime, deterministic=True)
+		conn.create_function("frappe_date_format", 2, frappe_date_format, deterministic=True)
+		conn.create_function("frappe_json_contains", 2, frappe_json_contains, deterministic=True)
+		conn.create_function("frappe_unix_timestamp", 1, self._unix_timestamp)
 		conn.create_function("now", 0, now)
 		pragmas = {
 			"journal_mode": "WAL",
@@ -139,8 +529,8 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 	def create_connection(self, read_only: bool = False):
 		db_path = self.get_db_path()
 		sqlite3.register_converter("timestamp", lambda x: datetime.fromisoformat(x.decode()))
-		sqlite3.register_converter("date", lambda x: date.fromisoformat(x.decode()))
-		sqlite3.register_converter("time", lambda x: time.fromisoformat(x.decode()))
+		sqlite3.register_converter("date", _convert_date)
+		sqlite3.register_converter("time", _convert_time)
 		if read_only:
 			return sqlite3.connect(
 				f"file:{db_path}?mode=ro",
@@ -157,7 +547,24 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 		self.sql(f"PRAGMA busy_timeout = {int(seconds) * 1000}")
 
 	def set_session_time_zone(self, timezone: str):
-		pass
+		self._session_time_zone = ZoneInfo(timezone)
+
+	def _unix_timestamp(self, value):
+		if value is None:
+			return None
+		if isinstance(value, bytes):
+			value = value.decode()
+		try:
+			parsed = (
+				datetime.combine(value, time())
+				if isinstance(value, date) and not isinstance(value, datetime)
+				else datetime.fromisoformat(str(value))
+			)
+		except (TypeError, ValueError):
+			return None
+		if parsed.tzinfo is None:
+			parsed = parsed.replace(tzinfo=self._session_time_zone)
+		return int(parsed.timestamp())
 
 	def setup_type_map(self):
 		self.db_type = "sqlite"
@@ -217,6 +624,7 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 	@staticmethod
 	def escape(s, percent=True):
 		"""Escape quotes and percent in given string."""
+		s = frappe.as_unicode(s)
 		s = s.replace("'", "''")
 		if percent:
 			s = s.replace("%", "%%")
@@ -463,19 +871,13 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 		raise NotImplementedError("SQLite does not support getting row size directly.")
 
 	def execute_query(self, query, values=None):
-		query = query.replace("%s", "?")
-		try:
-			if isinstance(values, dict):
-				for k, v in values.items():
-					if isinstance(v, str) and "'" in v:
-						values[k] = self.escape(v)
-					else:
-						values[k] = f"'{v}'"
-				query = query % values
-		except TypeError:
-			pass
+		return self._cursor.execute(query, values)
 
-		return self._cursor.execute(query, values or ())
+	def _transform_query(self, query, values):
+		return _prepare_query_parameters(query, values)
+
+	def mogrify(self, query, values):
+		return _mogrify_sqlite_query(query, values)
 
 	def log_query(self, query, query_type, values, debug):
 		# sqlite3 cursors expose no equivalent of the executed statement, so the
@@ -607,6 +1009,12 @@ def modify_query(query):
 	return transpiled if transpiled is not None else _legacy_modify_query(query)
 
 
+def _unwrap_single_argument_coalesce(node):
+	while isinstance(node, exp.Coalesce) and not node.expressions:
+		node = node.this.copy()
+	return node
+
+
 def _transpile_to_sqlite(query: str) -> str | None:
 	"""Returns the query rewritten for SQLite, or None if sqlglot couldn't
 	parse it (as MariaDB SQL), or didn't parse it as one of _TRANSPILABLE_STATEMENTS.
@@ -623,6 +1031,10 @@ def _transpile_to_sqlite(query: str) -> str | None:
 		if not isinstance(parsed, _TRANSPILABLE_STATEMENTS):
 			return None
 
+		# MariaDB permits COALESCE(x), but SQLite requires at least two arguments.
+		# A one-argument coalesce is exactly x, so remove the no-op without evaluating x twice.
+		parsed = parsed.transform(_unwrap_single_argument_coalesce)
+
 		# SQLite has no row-level locks. Remove only this known incompatibility;
 		# any other unsupported construct must take the safe fallback below.
 		for select in parsed.find_all(exp.Select):
@@ -634,34 +1046,47 @@ def _transpile_to_sqlite(query: str) -> str | None:
 		return None
 
 
-def _mask_query_parameters(query: str) -> tuple[str, list[str]]:
+def _mask_query_parameters(query: str) -> tuple[str, list[tuple[str, str, int | None]]]:
+	placeholders = list(_iter_query_placeholders(query))
+	marker_prefix = "__frappe_sql_parameter_"
+	while marker_prefix in query:
+		marker_prefix = "_" + marker_prefix
 	parameters = []
 	parts = []
-	for statement in sqlparse.parse(query):
-		for token in statement.flatten():
-			if token.ttype in sqlparse_tokens.Name.Placeholder and _PARAM_COMP.fullmatch(token.value):
-				parameters.append(token.value)
-				parts.append("?")
-			else:
-				parts.append(token.value)
+	query_position = 0
+	positional_index = 0
+	for marker_index, (start, end, _name, _parenthesized) in enumerate(placeholders):
+		parameter = query[start:end]
+		marker = f"{marker_prefix}{marker_index}__"
+		position = positional_index if parameter == "%s" else None
+		parameters.append((marker, parameter, position))
+		parts.extend((query[query_position:start], f":{marker}"))
+		query_position = end
+		if position is not None:
+			positional_index += 1
+	parts.append(query[query_position:])
 	return "".join(parts), parameters
 
 
-def _restore_query_parameters(query: str, parameters: list[str]) -> str:
-	parameter_index = 0
-	parts = []
-	for statement in sqlparse.parse(query):
-		for token in statement.flatten():
-			if token.ttype in sqlparse_tokens.Name.Placeholder and token.value == "?":
-				if parameter_index >= len(parameters):
-					raise ValueError("SQLGlot introduced an unexpected placeholder")
-				token.value = parameters[parameter_index]
-				parameter_index += 1
-			parts.append(token.value)
+def _restore_query_parameters(query: str, parameters: list[tuple[str, str, int | None]]) -> str:
+	marker_positions = {}
+	for marker, _parameter, _positional_index in parameters:
+		sentinel = f":{marker}"
+		if query.count(sentinel) != 1:
+			raise ValueError("SQLGlot changed a query placeholder")
+		marker_positions[marker] = query.index(sentinel)
 
-	if parameter_index != len(parameters):
-		raise ValueError("SQLGlot removed a query placeholder")
-	return "".join(parts)
+	positional_markers = [marker for marker, parameter, _index in parameters if parameter == "%s"]
+	positional_output_order = sorted(positional_markers, key=marker_positions.__getitem__)
+	positional_parameters_moved = positional_markers != positional_output_order
+
+	for marker, parameter, positional_index in parameters:
+		if positional_parameters_moved and positional_index is not None:
+			# SQLite's numbered placeholders retain the caller's original tuple order even
+			# when SQLGlot moves the corresponding AST expressions (for example LIMIT/OFFSET).
+			parameter = f"?{positional_index + 1}"
+		query = query.replace(f":{marker}", parameter)
+	return query
 
 
 def _legacy_modify_query(query: str) -> str:
