@@ -121,6 +121,48 @@ class TO_TSVECTOR(DistinctOptionFunction):
 		self._PLAINTO_TSQUERY = text
 
 
+class _SQLiteMatch(Function):
+	def __init__(self, column: str, *args, **kwargs):
+		"""SQLite implementation of Match/Against, backed by the FTS5 virtual table's own MATCH operator and bm25() ranking function.
+
+		Args: column (str)
+		"""
+		alias = kwargs.get("alias")
+		super().__init__("MATCH", column, *args, alias=alias)
+		self._against = None
+
+	@builder
+	def Against(self, text: str):
+		"""[ Text that has to be searched against ]
+
+		Args:
+		        text (str): [ the text string that we match it against ]
+		"""
+		self._against = text
+
+	def get_sql(self, **kwargs):
+		# Function.get_sql() pops with_alias before calling get_function_sql(), so the select-vs-where distinction below has to happen here instead
+		if self._against is None:
+			raise Exception("Chain the `Against()` method with match to complete the query")
+
+		kwargs = dict(kwargs)
+		with_alias = kwargs.pop("with_alias", False)
+		kwargs.pop("subquery", None)
+		quote_char = kwargs.pop("quote_char", None)
+		column_sql = self.args[0].get_sql(with_alias=False, subquery=True, quote_char=quote_char, **kwargs)
+
+		if with_alias:
+			# FTS5's `MATCH` can only be used in `WHERE`; relevance is retrieved using bm25(), which can't be used there. Since bm25() ranks lower values as better—the opposite of MariaDB's `MATCH...AGAINST`. We negate it to preserve ORDER BY DESC behavior.
+			table = self.args[0].table
+			table_sql = table.get_sql(quote_char=quote_char) if table is not None else column_sql
+			sql = f"-BM25({table_sql})"
+			return format_alias_sql(sql, self.alias, quote_char=quote_char, **kwargs)
+
+		# mirroring MariaDB's `+text*` boolean mode.
+		phrase = '"' + self._against.replace('"', '""') + '"*'
+		return f"{column_sql} MATCH {frappe.db.escape(phrase)}"
+
+
 class ConstantColumn(Term):
 	alias = None
 
@@ -137,24 +179,29 @@ class ConstantColumn(Term):
 		)
 
 
-# MONTHNAME/MONTH/QUARTER are MySQL-only. On postgres use to_char / date_part: to_char(.., 'FMMonth')
-# gives the full month name, and date_part gives the numeric month/quarter. date_part returns double
-# precision, so MONTH/QUARTER cast it back to INTEGER to match MySQL's integer result exactly (see
-# _PostgresIntDatePart) -- otherwise a `2.0` leaks into report JSON/UI where MariaDB shows `2`.
+# MONTHNAME/MONTH/QUARTER are MySQL-only. PostgreSQL uses to_char/date_part; SQLite uses
+# STRFTIME plus a month-name CASE expression. _IntDatePart casts numeric results to INTEGER so a
+# `2.0` or zero-padded `"02"` cannot leak into report JSON where MariaDB returns `2`.
 def _is_postgres() -> bool:
-	return bool(frappe.db) and frappe.db.db_type == "postgres"
+	return getattr(frappe.conf, "db_type", None) == "postgres"
 
 
-class _PostgresIntDatePart:
-	"""Mixin for the postgres date_part(...) functions below: wrap the result in
-	CAST(... AS INTEGER) so it matches MySQL's integer MONTH()/QUARTER(). Mirrors the
-	UnixTimestamp BIGINT cast. No-op on MariaDB (those branches use the native int function)."""
+def _is_sqlite() -> bool:
+	return getattr(frappe.conf, "db_type", None) == "sqlite"
+
+
+class _IntDatePart:
+	"""Return integer date parts consistently on PostgreSQL and SQLite."""
 
 	def get_sql(self, **kwargs):
-		if not self._postgres:
+		if not (self._postgres or self._sqlite):
 			return super().get_sql(**kwargs)
 		with_alias = kwargs.pop("with_alias", False)
-		sql = f"CAST({super().get_sql(**kwargs)} AS INTEGER)"
+		raw_sql = super().get_sql(**kwargs)
+		if self._sqlite and self._date_part == "quarter":
+			sql = f"CAST((CAST({raw_sql} AS INTEGER) + 2) / 3 AS INTEGER)"
+		else:
+			sql = f"CAST({raw_sql} AS INTEGER)"
 		if with_alias:
 			return format_alias_sql(sql, self.alias, **kwargs)
 		return sql
@@ -162,34 +209,75 @@ class _PostgresIntDatePart:
 
 class MonthName(Function):
 	def __init__(self, field, alias=None):
+		self._sqlite = _is_sqlite()
 		if _is_postgres():
 			super().__init__("to_char", field, "FMMonth", alias=alias)
+		elif self._sqlite:
+			super().__init__("STRFTIME", field, alias=alias)
 		else:
 			super().__init__("MONTHNAME", field, alias=alias)
 
+	def get_function_sql(self, **kwargs):
+		if not self._sqlite:
+			return super().get_function_sql(**kwargs)
+		field = self.args[0].get_sql(with_alias=False, subquery=True, **kwargs)
+		months = " ".join(
+			f"WHEN '{number:02}' THEN '{name}'"
+			for number, name in enumerate(
+				(
+					"January",
+					"February",
+					"March",
+					"April",
+					"May",
+					"June",
+					"July",
+					"August",
+					"September",
+					"October",
+					"November",
+					"December",
+				),
+				start=1,
+			)
+		)
+		return f"CASE STRFTIME('%m', {field}) {months} END"
 
-class Quarter(_PostgresIntDatePart, Function):
+
+class Quarter(_IntDatePart, Function):
 	def __init__(self, field, alias=None):
 		self._postgres = _is_postgres()
+		self._sqlite = _is_sqlite()
+		self._date_part = "quarter"
 		if self._postgres:
 			super().__init__("date_part", "quarter", field, alias=alias)
+		elif self._sqlite:
+			super().__init__("STRFTIME", "%m", field, alias=alias)
 		else:
 			super().__init__("QUARTER", field, alias=alias)
 
 
-class Month(_PostgresIntDatePart, Function):
+class Month(_IntDatePart, Function):
 	def __init__(self, field, alias=None):
 		self._postgres = _is_postgres()
+		self._sqlite = _is_sqlite()
+		self._date_part = "month"
 		if self._postgres:
 			super().__init__("date_part", "month", field, alias=alias)
+		elif self._sqlite:
+			super().__init__("STRFTIME", "%m", field, alias=alias)
 		else:
 			super().__init__("MONTH", field, alias=alias)
 
 
-class Year(_PostgresIntDatePart, Function):
+class Year(_IntDatePart, Function):
 	def __init__(self, field, alias=None):
 		self._postgres = _is_postgres()
+		self._sqlite = _is_sqlite()
+		self._date_part = "year"
 		if self._postgres:
 			super().__init__("date_part", "year", field, alias=alias)
+		elif self._sqlite:
+			super().__init__("STRFTIME", "%Y", field, alias=alias)
 		else:
 			super().__init__("YEAR", field, alias=alias)
