@@ -11,31 +11,30 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  SHARD_COUNT: 4
+
 jobs:
   discover:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+      tests: ${{ steps.set-tests.outputs.tests }}
     steps:
       - uses: actions/checkout@v7
-      - id: set-matrix
+      - id: set-tests
         run: |
-          matrix=$(find . -path '*/doctype/*/test_*.py' | xargs grep -l 'def test_' | awk '{
+          tests=$(find . -path '*/doctype/*/test_*.py' | xargs grep -l 'def test_' | awk '{
               gsub(/^\.\//, "", $0)
               gsub(/\.py$/, "", $0)
               gsub(/\//, ".", $0)
-              tests[NR] = $0
-          }
-          END {
-              printf "{\n  \"include\": [\n"
-              for (i = 1; i <= NR; i++) {
-                  printf "    {\"test\": \"%s\"}", tests[i]
-                  if (i < NR) printf ","
-                  printf "\n"
-              }
-              printf "  ]\n}"
-          }')
-          echo "matrix=$(echo "$matrix" | jq -c)" >> "$GITHUB_OUTPUT"
+              print
+          }' | sort | jq -R . | jq -sc .)
+          echo "tests=$tests" >> "$GITHUB_OUTPUT"
+      - id: set-matrix
+        run: |
+          matrix=$(jq -nc --argjson count "$SHARD_COUNT" '{"include": [range(1; $count + 1) | {"shard": .}]}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   test:
     needs: discover
@@ -43,10 +42,12 @@ jobs:
     timeout-minutes: 60
     env:
       NODE_ENV: production
+      ALL_TESTS: ${{ needs.discover.outputs.tests }}
+      SHARD_INDEX: ${{ matrix.shard }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
-    name: SQLite / ${{ matrix.test }}
+    name: SQLite Shard
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
@@ -56,10 +57,39 @@ jobs:
           node-version: 24
           db: sqlite
           db-root-password: db_root
-          # Keep Redis available, but do not start another process that can
-          # contend with the test runner for SQLite's single writer lock.
+          # HTTP services are unnecessary for unit tests and can open extra
+          # SQLite connections. Keep the worker: background-job tests depend
+          # on it to consume jobs from Redis.
           disable-web: true
           disable-socketio: true
-          disable-workers: true
+      - name: Wait for setup jobs
+        shell: bash
+        run: |
+          # Site creation can leave background jobs for the worker. Let those
+          # finish before the test runner starts writing to SQLite, which only
+          # permits one writer at a time.
+          for attempt in {1..20}; do
+            if bench --site test_site ready-for-migration; then
+              exit 0
+            fi
+            echo "Waiting for setup jobs to finish (attempt $attempt/20)..."
+            sleep 1
+          done
+
+          echo "Setup jobs did not finish within the expected time."
+          bench --site test_site show-pending-jobs || true
+          exit 1
       - name: Run Tests
-        run: bench --site test_site run-tests --app frappe --module ${{ matrix.test }}
+        shell: bash
+        run: |
+          echo "$ALL_TESTS" | jq -r --argjson shard "$SHARD_INDEX" --argjson total "$SHARD_COUNT" \
+            '[to_entries[] | select(.key % $total == ($shard - 1)) | .value] | .[]' > shard_tests.txt
+
+          status=0
+          while IFS= read -r test; do
+            echo "::group::$test"
+            bench --site test_site run-tests --app frappe --module "$test" || status=1
+            echo "::endgroup::"
+          done < shard_tests.txt
+
+          exit $status
