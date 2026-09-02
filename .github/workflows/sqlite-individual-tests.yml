@@ -56,5 +56,10 @@ jobs:
           node-version: 24
           db: sqlite
           db-root-password: db_root
+          # Keep Redis available, but do not start another process that can
+          # contend with the test runner for SQLite's single writer lock.
+          disable-web: true
+          disable-socketio: true
+          disable-workers: true
       - name: Run Tests
         run: bench --site test_site run-tests --app frappe --module ${{ matrix.test }}
