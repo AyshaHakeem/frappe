@@ -22,6 +22,10 @@ inputs:
   disable-socketio:
     required: false
     default: false
+  disable-workers:
+    required: false
+    description: 'Whether to disable background workers'
+    default: false
   db:
     required: false
     default: mariadb
@@ -140,6 +144,9 @@ runs:
       fi
       if [ "${{ inputs.disable-socketio }}" == "true" ]; then
         sed -i '/^socketio:/d' Procfile
+      fi
+      if [ "${{ inputs.disable-workers }}" == "true" ]; then
+        sed -i '/^worker[^:]*:/d' Procfile
       fi
 
       end_time=$(date +%s)
