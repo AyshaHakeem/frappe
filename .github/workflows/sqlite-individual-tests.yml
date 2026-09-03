@@ -44,6 +44,10 @@ jobs:
       NODE_ENV: production
       ALL_TESTS: ${{ needs.discover.outputs.tests }}
       SHARD_INDEX: ${{ matrix.shard }}
+      # This profile deliberately has no web server.  Tests that need one
+      # declare it with requires_test_service(TestService.WEB_SERVER).
+      FRAPPE_TEST_WEB_SERVER: "0"
+      FRAPPE_TEST_BACKGROUND_WORKER: "1"
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
@@ -57,9 +61,7 @@ jobs:
           node-version: 24
           db: sqlite
           db-root-password: db_root
-          # HTTP services are unnecessary for unit tests and can open extra
-          # SQLite connections. Keep the worker: background-job tests depend
-          # on it to consume jobs from Redis.
+          # HTTP services are unnecessary for unit tests and can open extra SQLite connections.
           disable-web: true
           disable-socketio: true
       - name: Wait for setup jobs
@@ -93,3 +95,53 @@ jobs:
           done < shard_tests.txt
 
           exit $status
+
+  http-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      NODE_ENV: production
+      # Run the small HTTP contract separately, with every service that those  tests declare.
+      FRAPPE_TEST_WEB_SERVER: "1"
+      FRAPPE_TEST_BACKGROUND_WORKER: "1"
+    name: SQLite HTTP integration
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        name: Environment Setup
+        with:
+          python-version: "3.14"
+          node-version: 24
+          db: sqlite
+          db-root-password: db_root
+          disable-socketio: true
+      - name: Wait for setup jobs
+        shell: bash
+        run: |
+          for attempt in {1..20}; do
+            if bench --site test_site ready-for-migration; then
+              exit 0
+            fi
+            echo "Waiting for setup jobs to finish (attempt $attempt/20)..."
+            sleep 1
+          done
+
+          echo "Setup jobs did not finish within the expected time."
+          bench --site test_site show-pending-jobs || true
+          exit 1
+      - name: Run HTTP-dependent SQLite tests
+        shell: bash
+        run: |
+          run_test() {
+            local module="$1"
+            shift
+            bench --site test_site run-tests --app frappe --module "$module" "$@"
+          }
+
+          run_test frappe.automation.doctype.auto_repeat.test_auto_repeat --test test_email_notification
+          run_test frappe.core.doctype.access_log.test_access_log --test test_private_file_download
+          run_test frappe.core.doctype.file.test_file --test test_make_thumbnail
+          run_test frappe.core.doctype.server_script.test_server_script --test test_api
+          run_test frappe.integrations.doctype.connected_app.test_connected_app \
+            --test test_web_application_flow \
+            --test test_concurrent_refresh_skips_redundant_call
