@@ -357,7 +357,11 @@ class TestDBQuery(IntegrationTestCase):
 			or_filters=[["Has Role", "role", "=", "Guest"], ["User", "enabled", "=", 1]],
 			fields=["name", "modified", "language.language_name as language_title"],
 			group_by="`tabUser`.`name`",
-			order_by="modified desc",
+			# qualified: bare "modified" is ambiguous once "Has Role" is joined in (every
+			# doctype table has its own `modified` column) — MariaDB happens to resolve an
+			# unqualified ORDER BY name against the SELECT list first, but SQLite rejects it
+			# outright as ambiguous, so this needs to be unambiguous on every backend.
+			order_by="`tabUser`.modified desc",
 		)
 		self.assertIn("Administrator", [r.name for r in result])
 

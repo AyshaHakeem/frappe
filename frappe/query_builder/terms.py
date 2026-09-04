@@ -74,7 +74,24 @@ class ParameterizedValueWrapper(ValueWrapper):
 
 
 class SQLiteParameterizedValueWrapper(ParameterizedValueWrapper, SQLLiteValueWrapper):
-	pass
+	def get_sql(
+		self,
+		quote_char: str | None = None,
+		secondary_quote_char: str = "'",
+		param_wrapper: NamedParameterWrapper | None = None,
+		**kwargs: Any,
+	) -> str:
+		if param_wrapper and isinstance(self.value, str):
+			# sqlite3 quotes bound strings itself. Passing SQLite-rendered SQL here would
+			# bind the surrounding quote characters as part of the actual string value.
+			sql = param_wrapper.get_sql(param_value=self.value, **kwargs)
+			return format_alias_sql(sql, self.alias, quote_char=quote_char, **kwargs)
+		return super().get_sql(
+			quote_char=quote_char,
+			secondary_quote_char=secondary_quote_char,
+			param_wrapper=param_wrapper,
+			**kwargs,
+		)
 
 
 class ParameterizedFunction(Function):
