@@ -4,13 +4,21 @@ from enum import Enum
 from importlib import import_module
 from typing import Any, get_type_hints
 
-from pypika.queries import Column, QueryBuilder, _SetOperation
+# These PyPika classes are intentionally extended with Frappe's long-standing
+# run/walk adapters below; PyPika does not expose hooks for those entry points.
+from pypika.queries import (  # nosemgrep: frappe-monkey-patching-not-allowed
+	Column,
+	QueryBuilder,
+	_SetOperation,
+)
 from pypika.terms import PseudoColumn
 
 import frappe
 from frappe.query_builder.terms import NamedParameterWrapper
 
-from .builder import Base, MariaDB, Postgres, SQLite
+# Frappe's public query-builder helpers are installed on Base below. This is the
+# existing framework extension mechanism rather than an app overriding Frappe.
+from .builder import Base, MariaDB, Postgres, SQLite  # nosemgrep: frappe-monkey-patching-not-allowed
 
 
 class PseudoColumnMapper(PseudoColumn):
@@ -19,7 +27,11 @@ class PseudoColumnMapper(PseudoColumn):
 
 	def get_sql(self, **kwargs):
 		if frappe.db.db_type == "postgres":
-			self.name = self.name.replace("`", '"')
+			# Returned, not assigned to `self.name`: rendering must not mutate the term, or a
+			# pseudo-column rendered once on postgres renders wrongly everywhere after.
+			from frappe.database.utils import convert_backtick_identifiers
+
+			return convert_backtick_identifiers(self.name)
 		return self.name
 
 
@@ -166,6 +178,9 @@ def execute_query(query, *args, **kwargs):
 	child_queries = query._child_queries
 	name_field_injected = query.__dict__.get("_name_field_injected", False)
 	query, params = prepare_query(query)
+	if frappe.local.db.db_type == "sqlite":
+		# The SQLite query builder already emitted the target dialect.
+		kwargs["_skip_sqlite_transpilation"] = True
 	result = frappe.local.db.sql(query, params, *args, **kwargs)  # nosemgrep
 
 	if child_queries and isinstance(child_queries, list) and result:
